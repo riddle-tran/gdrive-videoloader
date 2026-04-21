@@ -80,6 +80,33 @@ def load_cookies_from_file(cookie_file: str, verbose: bool = False) -> requests.
     return jar
 
 
+def save_cookies_to_file(cookie_jar: requests.cookies.RequestsCookieJar, cookie_file: str, verbose: bool = False) -> None:
+    """Saves a Requests cookie jar into browser-exported JSON-like format."""
+    if not cookie_file:
+        return
+
+    cookies_data = []
+    for cookie in cookie_jar:
+        item = {
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain,
+            "path": cookie.path or "/",
+            "secure": bool(cookie.secure),
+        }
+        if cookie.expires is not None:
+            item["expirationDate"] = cookie.expires
+        cookies_data.append(item)
+
+    try:
+        with open(cookie_file, 'w', encoding='utf-8') as f:
+            json.dump(cookies_data, f, ensure_ascii=False, indent=2)
+        if verbose:
+            print(f"[INFO] Saved {len(cookies_data)} cookies to {cookie_file}")
+    except Exception as e:
+        print(f"[WARN] Could not save cookie file: {e}")
+
+
 class DownloadStatusTracker:
     """Persists file-level status so users can inspect progress across runs."""
 
@@ -634,7 +661,7 @@ def download_drive_api_file(file_info: dict, access_token: str, local_path: str,
     return True, response.status_code
 
 
-def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chunk_size: int, verbose: bool, tracker: DownloadStatusTracker) -> tuple[bool, int | None]:
+def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chunk_size: int, verbose: bool, tracker: DownloadStatusTracker, cookie_file: str = None) -> tuple[bool, int | None]:
     """Downloads one Drive file via browser cookies (fallback path for restricted files)."""
     rel = file_info["relative_path"]
     remote_size = file_info.get("size")
@@ -687,6 +714,7 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
     session = requests.Session()
     session.cookies.update(cookie_jar)
     response = None
+    cookies_changed = False
 
     # For video files, prefer resolving the direct playback URL first.
     if file_info.get("mimeType", "").startswith("video/"):
@@ -694,6 +722,9 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
         if resource_key:
             info_url += f"&resourcekey={resource_key}"
         info_resp = session.get(info_url, allow_redirects=True)
+        if info_resp.cookies:
+            cookie_jar.update(info_resp.cookies)
+            cookies_changed = True
 
         merged_cookies = requests.cookies.RequestsCookieJar()
         merged_cookies.update(cookie_jar)
@@ -702,6 +733,9 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
         video_url, _ = get_video_url(info_resp.text, verbose=False)
         if video_url:
             response = requests.get(video_url, stream=True, cookies=merged_cookies, headers=headers)
+            if response.cookies:
+                cookie_jar.update(response.cookies)
+                cookies_changed = True
 
     if response is None:
         response = session.get(url, params=params, headers=headers, stream=True, allow_redirects=True)
@@ -723,6 +757,15 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
                 if token:
                     params["confirm"] = token
                     response = session.get(url, params=params, headers=headers, stream=True, allow_redirects=True)
+
+    if session.cookies:
+        cookie_jar.update(session.cookies)
+        cookies_changed = True
+    if response.cookies:
+        cookie_jar.update(response.cookies)
+        cookies_changed = True
+    if cookies_changed and cookie_file:
+        save_cookies_to_file(cookie_jar, cookie_file, verbose)
 
     if response.status_code == 416 and remote_size is not None:
         tracker.set_file(rel, status="completed", bytes_downloaded=remote_size, total_bytes=remote_size, download_method="cookie")
@@ -821,7 +864,7 @@ def download_drive_folder(folder_input: str, output_dir: str, chunk_size: int, v
         if not ok and cookie_jar and api_status_code in (403, 404):
             if verbose:
                 print(f"[INFO] API failed ({api_status_code}), retrying with cookies: {rel}")
-            ok, _ = download_drive_cookie_file(item, cookie_jar, local_path, chunk_size, verbose, tracker)
+            ok, _ = download_drive_cookie_file(item, cookie_jar, local_path, chunk_size, verbose, tracker, cookie_file)
         elif not ok and cookie_jar and verbose:
             print(f"[INFO] API failed ({api_status_code}), skipping cookie fallback for: {rel}")
 
