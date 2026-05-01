@@ -9,6 +9,8 @@ import threading
 import math
 import shutil
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 try:
@@ -85,6 +87,7 @@ class DownloadStatusTracker:
 
     def __init__(self, status_file: str):
         self.status_file = status_file
+        self._lock = threading.RLock()
         self.data = {
             "updated_at": utc_now_iso(),
             "summary": {
@@ -127,17 +130,23 @@ class DownloadStatusTracker:
         self.data["summary"] = summary
         self.data["updated_at"] = utc_now_iso()
 
-    def save(self) -> None:
+    def _save_unlocked(self) -> None:
         self._recompute_summary()
         with open(self.status_file, 'w', encoding='utf-8') as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
 
-    def set_file(self, key: str, **kwargs) -> None:
-        current = self.data.setdefault("files", {}).get(key, {})
-        current.update(kwargs)
-        current["updated_at"] = utc_now_iso()
-        self.data["files"][key] = current
-        self.save()
+    def save(self) -> None:
+        with self._lock:
+            self._save_unlocked()
+
+    def set_file(self, key: str, autosave: bool = True, **kwargs) -> None:
+        with self._lock:
+            current = self.data.setdefault("files", {}).get(key, {})
+            current.update(kwargs)
+            current["updated_at"] = utc_now_iso()
+            self.data["files"][key] = current
+            if autosave:
+                self._save_unlocked()
 
 
 def print_status_summary(status_file: str) -> None:
@@ -611,13 +620,25 @@ def download_drive_api_file(file_info: dict, access_token: str, local_path: str,
     with open(local_path, file_mode) as file:
         with tqdm(total=total_size, initial=downloaded_size, unit='B', unit_scale=True, desc=rel, file=sys.stdout) as pbar:
             current = downloaded_size
+            progress_flush_step = max(chunk_size * 8, 4 * 1024 * 1024)
+            next_flush_at = current + progress_flush_step
+            last_flush = time.monotonic()
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if not chunk:
                     continue
                 file.write(chunk)
                 current += len(chunk)
                 pbar.update(len(chunk))
-                tracker.set_file(rel, status="downloading", bytes_downloaded=current, total_bytes=total_size)
+                now = time.monotonic()
+                if current >= next_flush_at or (now - last_flush) >= 2.0:
+                    tracker.set_file(
+                        rel,
+                        status="downloading",
+                        bytes_downloaded=current,
+                        total_bytes=total_size,
+                    )
+                    next_flush_at = current + progress_flush_step
+                    last_flush = now
 
     final_size = os.path.getsize(local_path)
     if remote_size is not None and final_size != remote_size:
@@ -743,13 +764,25 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
     with open(local_path, file_mode) as file:
         with tqdm(total=total_size, initial=downloaded_size, unit='B', unit_scale=True, desc=rel, file=sys.stdout) as pbar:
             current = downloaded_size
+            progress_flush_step = max(chunk_size * 8, 4 * 1024 * 1024)
+            next_flush_at = current + progress_flush_step
+            last_flush = time.monotonic()
             for chunk in response.iter_content(chunk_size=chunk_size):
                 if not chunk:
                     continue
                 file.write(chunk)
                 current += len(chunk)
                 pbar.update(len(chunk))
-                tracker.set_file(rel, status="downloading", bytes_downloaded=current, total_bytes=total_size)
+                now = time.monotonic()
+                if current >= next_flush_at or (now - last_flush) >= 2.0:
+                    tracker.set_file(
+                        rel,
+                        status="downloading",
+                        bytes_downloaded=current,
+                        total_bytes=total_size,
+                    )
+                    next_flush_at = current + progress_flush_step
+                    last_flush = now
 
     final_size = os.path.getsize(local_path)
     if remote_size is not None and final_size != remote_size:
@@ -766,7 +799,7 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
     return True, response.status_code
 
 
-def download_drive_folder(folder_input: str, output_dir: str, chunk_size: int, verbose: bool, client_secrets_file: str, token_file: str, status_file: str, cookie_file: str = None) -> None:
+def download_drive_folder(folder_input: str, output_dir: str, chunk_size: int, verbose: bool, client_secrets_file: str, token_file: str, status_file: str, cookie_file: str = None, file_workers: int = 4) -> None:
     """Recursively downloads all files in a Google Drive folder while preserving hierarchy."""
     if not ensure_drive_api_available():
         return
@@ -801,7 +834,9 @@ def download_drive_folder(folder_input: str, output_dir: str, chunk_size: int, v
     failed = 0
     skipped = 0
 
-    for index, item in enumerate(files, start=1):
+    creds_lock = threading.Lock()
+
+    def process_file(index: int, item: dict) -> str:
         rel = item["relative_path"]
         mime_type = item.get("mimeType", "")
         local_path = os.path.join(output_dir, rel)
@@ -811,28 +846,58 @@ def download_drive_folder(folder_input: str, output_dir: str, chunk_size: int, v
 
         if mime_type.startswith(GOOGLE_APPS_MIME_PREFIX):
             tracker.set_file(rel, status="skipped", reason=f"unsupported_mime:{mime_type}")
-            skipped += 1
-            continue
+            return "skipped"
 
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+        try:
+            with creds_lock:
+                if creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                access_token = creds.token
 
-        ok, api_status_code = download_drive_api_file(item, creds.token, local_path, chunk_size, verbose, tracker)
-        if not ok and cookie_jar and api_status_code in (403, 404):
-            if verbose:
-                print(f"[INFO] API failed ({api_status_code}), retrying with cookies: {rel}")
-            ok, _ = download_drive_cookie_file(item, cookie_jar, local_path, chunk_size, verbose, tracker)
-        elif not ok and cookie_jar and verbose:
-            print(f"[INFO] API failed ({api_status_code}), skipping cookie fallback for: {rel}")
+            ok, api_status_code = download_drive_api_file(item, access_token, local_path, chunk_size, verbose, tracker)
+            if not ok and cookie_jar and api_status_code in (403, 404):
+                if verbose:
+                    print(f"[INFO] API failed ({api_status_code}), retrying with cookies: {rel}")
+                ok, _ = download_drive_cookie_file(item, cookie_jar, local_path, chunk_size, verbose, tracker)
+            elif not ok and cookie_jar and verbose:
+                print(f"[INFO] API failed ({api_status_code}), skipping cookie fallback for: {rel}")
 
-        current_state = tracker.data.get("files", {}).get(rel, {}).get("status")
+            current_state = tracker.data.get("files", {}).get(rel, {}).get("status")
 
-        if ok and current_state == "completed":
-            completed += 1
-        elif current_state == "skipped":
-            skipped += 1
-        else:
-            failed += 1
+            if ok and current_state == "completed":
+                return "completed"
+            if current_state == "skipped":
+                return "skipped"
+            return "failed"
+        except Exception as err:
+            tracker.set_file(rel, status="failed", error=f"exception:{err}")
+            return "failed"
+
+    if file_workers <= 1:
+        for index, item in enumerate(files, start=1):
+            result = process_file(index, item)
+            if result == "completed":
+                completed += 1
+            elif result == "skipped":
+                skipped += 1
+            else:
+                failed += 1
+    else:
+        with ThreadPoolExecutor(max_workers=file_workers) as executor:
+            futures = [
+                executor.submit(process_file, index, item)
+                for index, item in enumerate(files, start=1)
+            ]
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result == "completed":
+                    completed += 1
+                elif result == "skipped":
+                    skipped += 1
+                else:
+                    failed += 1
+
+    tracker.save()
 
     print("\nFolder download summary")
     print(f"Completed: {completed}")
@@ -890,6 +955,7 @@ if __name__ == "__main__":
     parser.add_argument("--auth-client-secrets", type=str, default="client_secret.json", help="Path to OAuth client secret JSON file for folder mode.")
     parser.add_argument("--auth-token-file", type=str, default="token.json", help="Path to OAuth token cache JSON file for folder mode.")
     parser.add_argument("--status-file", type=str, default="download_status.json", help="Path to JSON status file used by --folder mode.")
+    parser.add_argument("--file-workers", type=int, default=4, choices=range(1, 33), help="Number of files to download concurrently in --folder mode (1-32). Default is 4.")
     parser.add_argument("--show-status", action="store_true", help="Print summary from --status-file and exit.")
     parser.add_argument("--version", action="version", version="%(prog)s 1.1.0")
 
@@ -910,6 +976,7 @@ if __name__ == "__main__":
             token_file=args.auth_token_file,
             status_file=args.status_file,
             cookie_file=args.cookie_file,
+            file_workers=args.file_workers,
         )
     elif args.video_id:
         download_single_video(args.video_id, args.output, args.chunk_size, args.threads, args.verbose, args.cookie_file)
