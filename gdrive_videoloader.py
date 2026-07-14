@@ -576,9 +576,20 @@ def download_drive_api_file(file_info: dict, access_token: str, local_path: str,
 
     downloaded_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
     if remote_size is not None and downloaded_size > remote_size:
-        downloaded_size = 0
-        with open(local_path, 'wb'):
-            pass
+        tracker.set_file(
+            rel,
+            status="skipped",
+            bytes_downloaded=downloaded_size,
+            total_bytes=remote_size,
+            reason=f"local_file_larger_than_remote local={downloaded_size} remote={remote_size}",
+            local_path=local_path,
+            mime_type=file_info.get("mimeType"),
+            md5_checksum=md5_checksum,
+            download_method="api",
+        )
+        if verbose:
+            print(f"[INFO] Skipping oversized local file for manual verification: {rel}")
+        return True, None
 
     tracker.set_file(
         rel,
@@ -685,9 +696,20 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
             pass
 
     if remote_size is not None and downloaded_size > remote_size:
-        downloaded_size = 0
-        with open(local_path, 'wb'):
-            pass
+        tracker.set_file(
+            rel,
+            status="skipped",
+            bytes_downloaded=downloaded_size,
+            total_bytes=remote_size,
+            reason=f"local_file_larger_than_remote local={downloaded_size} remote={remote_size}",
+            local_path=local_path,
+            mime_type=file_info.get("mimeType"),
+            md5_checksum=md5_checksum,
+            download_method="cookie",
+        )
+        if verbose:
+            print(f"[INFO] Skipping oversized local file for manual verification: {rel}")
+        return True, None
 
     tracker.set_file(
         rel,
