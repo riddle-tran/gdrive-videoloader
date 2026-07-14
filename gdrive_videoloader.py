@@ -561,6 +561,7 @@ def download_drive_api_file(file_info: dict, access_token: str, local_path: str,
     rel = file_info["relative_path"]
     remote_size = file_info.get("size")
     file_id = file_info["id"]
+    md5_checksum = file_info.get("md5Checksum")
     resource_key = file_info.get("resourceKey")
 
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -568,7 +569,7 @@ def download_drive_api_file(file_info: dict, access_token: str, local_path: str,
     if os.path.exists(local_path) and remote_size is not None:
         local_size = os.path.getsize(local_path)
         if local_size == remote_size:
-            tracker.set_file(rel, status="skipped", bytes_downloaded=local_size, total_bytes=remote_size, reason="already_exists", download_method="api")
+            tracker.set_file(rel, status="skipped", bytes_downloaded=local_size, total_bytes=remote_size, reason="already_exists", download_method="api", md5_checksum=md5_checksum)
             if verbose:
                 print(f"[INFO] Skipped existing file: {rel}")
             return True, None
@@ -587,6 +588,7 @@ def download_drive_api_file(file_info: dict, access_token: str, local_path: str,
         total_bytes=remote_size,
         local_path=local_path,
         mime_type=file_info.get("mimeType"),
+        md5_checksum=md5_checksum,
         download_method="api",
     )
 
@@ -641,7 +643,7 @@ def download_drive_api_file(file_info: dict, access_token: str, local_path: str,
                     last_flush = now
 
     final_size = os.path.getsize(local_path)
-    if remote_size is not None and final_size != remote_size:
+    if remote_size is not None and final_size < remote_size:
         tracker.set_file(
             rel,
             status="failed",
@@ -660,6 +662,7 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
     rel = file_info["relative_path"]
     remote_size = file_info.get("size")
     file_id = file_info["id"]
+    md5_checksum = file_info.get("md5Checksum")
     resource_key = file_info.get("resourceKey")
 
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
@@ -667,7 +670,7 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
     if os.path.exists(local_path) and remote_size is not None:
         local_size = os.path.getsize(local_path)
         if local_size == remote_size:
-            tracker.set_file(rel, status="skipped", bytes_downloaded=local_size, total_bytes=remote_size, reason="already_exists", download_method="cookie")
+            tracker.set_file(rel, status="skipped", bytes_downloaded=local_size, total_bytes=remote_size, reason="already_exists", download_method="cookie", md5_checksum=md5_checksum)
             if verbose:
                 print(f"[INFO] Skipped existing file: {rel}")
             return True, None
@@ -694,6 +697,7 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
         total_bytes=remote_size,
         local_path=local_path,
         mime_type=file_info.get("mimeType"),
+        md5_checksum=md5_checksum,
         download_method="cookie",
     )
 
@@ -785,7 +789,7 @@ def download_drive_cookie_file(file_info: dict, cookie_jar, local_path: str, chu
                     last_flush = now
 
     final_size = os.path.getsize(local_path)
-    if remote_size is not None and final_size != remote_size:
+    if remote_size is not None and final_size < remote_size:
         tracker.set_file(
             rel,
             status="failed",
@@ -828,6 +832,7 @@ def download_drive_folder(folder_input: str, output_dir: str, chunk_size: int, v
             total_bytes=item.get("size"),
             local_path=os.path.join(output_dir, rel),
             mime_type=item.get("mimeType"),
+            md5_checksum=item.get("md5Checksum"),
         )
 
     completed = 0
